@@ -12,12 +12,16 @@ URL = 'http://ystug.co.kr/sub07/sub03_01.php'
 STATE = Path('state.json')
 KST = ZoneInfo('Asia/Seoul')
 FIELDS = ['선박명', '총톤수', '흘수', '요청일시', '시작점', '종료점', 'Work', 'B', 'B/T', '배정예선']
-# Only notify changes to operational details, not formatting or tonnage.
 CHANGE_FIELDS = ['요청일시', '시작점', '종료점', 'Work', 'B', 'B/T', '배정예선']
 
 
-def parse_rows(html):
+def parse_rows(html, requested_day):
     soup = BeautifulSoup(html, 'html.parser')
+    date_input = soup.select_one('input[name="p_dt_req"]')
+    returned_day = (date_input.get('value') or '').strip() if date_input else ''
+    if returned_day != requested_day:
+        raise RuntimeError(f'날짜 불일치: 요청 {requested_day}, 응답 {returned_day or "없음"}. 상태 저장 및 알림 중단')
+
     table = soup.select_one('table.wover_table')
     if table is None:
         raise RuntimeError('예선 배정표를 찾지 못했습니다.')
@@ -31,9 +35,11 @@ def parse_rows(html):
             continue
         data = dict(zip(headings, cells))
         key = '|'.join(data.get(x, '') for x in ['선박명', '요청일시', '시작점', '종료점'])
+        if key in rows:
+            raise RuntimeError(f'동일 작업 식별값 중복: {key}. 잘못된 변경 알림 방지를 위해 중단')
         rows[key] = {k: data.get(k, '') for k in FIELDS}
     if not rows:
-        raise RuntimeError('조회 결과가 비어 있어 기존 상태를 보존합니다.')
+        raise RuntimeError(f'{requested_day}: 배정표가 비어 있어 기존 상태를 보존합니다.')
     return rows
 
 
@@ -54,13 +60,8 @@ def normalized_name(row):
 
 
 def match_rows(old_rows, current):
-    """Exact identity first, then unique same-ship matches for changed times/ports.
-
-    If a ship has multiple unmatched jobs, don't guess their identities.
-    """
     pairs = []
-    old_remaining = dict(old_rows)
-    new_remaining = dict(current)
+    old_remaining, new_remaining = dict(old_rows), dict(current)
     for key in set(old_remaining) & set(new_remaining):
         pairs.append((old_remaining.pop(key), new_remaining.pop(key)))
     names = set(map(normalized_name, old_remaining.values())) & set(map(normalized_name, new_remaining.values()))
@@ -85,31 +86,33 @@ def send(token, chat_id, kind, row, changes=None):
     lines = [f'[{kind}] 서65', describe(row)]
     if changes:
         lines.append('변경: ' + ' / '.join(f'{k}: {before or "-"} → {after or "-"}' for k, before, after in changes))
-    response = requests.post(
-        f'https://api.telegram.org/bot{token}/sendMessage',
-        json={'chat_id': chat_id, 'text': '\n'.join(lines)}, timeout=20)
+    response = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                             json={'chat_id': chat_id, 'text': '\n'.join(lines)}, timeout=20)
     response.raise_for_status()
     if not response.json().get('ok'):
         raise RuntimeError('텔레그램 전송 실패')
 
 
-def fetch_rows(day):
-    response = requests.post(
-        URL, data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
-        headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
+def fetch_rows(day, session):
+    response = session.post(URL,
+                            data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
+                            headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
     response.raise_for_status()
     response.encoding = response.apparent_encoding if response.apparent_encoding.lower() != 'ascii' else 'utf-8'
-    return parse_rows(response.text)
+    return parse_rows(response.text, day)
 
 
 def main():
     now = datetime.now(KST)
     days = [now.strftime('%Y%m%d'), (now + timedelta(days=1)).strftime('%Y%m%d')]
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    token, chat_id = os.environ.get('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
         raise RuntimeError('GitHub Secrets를 확인하세요.')
-    current_by_day = {day: fetch_rows(day) for day in days}
+    with requests.Session() as session:
+        current_by_day = {day: fetch_rows(day, session) for day in days}
+    if current_by_day[days[0]] == current_by_day[days[1]]:
+        raise RuntimeError('오늘과 내일 배정표가 완전히 동일합니다. 날짜 필터 미적용 가능성으로 알림과 상태 저장을 중단합니다.')
+
     previous = json.loads(STATE.read_text(encoding='utf-8')) if STATE.exists() else {}
     if 'days' in previous:
         previous_by_day = previous['days']
@@ -122,7 +125,7 @@ def main():
         current = current_by_day[day]
         old_rows = previous_by_day.get(day)
         if old_rows is None:
-            print(f'{day}: 첫 조회 기준 데이터 저장 (알림 없음)')
+            print(f'{day}: {len(current)}건 조회 완료 / 첫 조회 기준 데이터 저장 (알림 없음)')
             continue
         counts = {'신규배정': 0, '작업변경': 0, '작업취소': 0}
         for old, new in match_rows(old_rows, current):
