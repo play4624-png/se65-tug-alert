@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 from datetime import datetime, timedelta
@@ -35,9 +36,18 @@ def parse_rows(html, requested_day):
             continue
         data = dict(zip(headings, cells))
         key = '|'.join(data.get(x, '') for x in ['선박명', '요청일시', '시작점', '종료점'])
+        # Keep every row, including jobs sharing the same ship/time/ports.
+        # A content fingerprint makes duplicate keys stable across row reordering.
+        record = {k: data.get(k, '') for k in FIELDS}
         if key in rows:
-            raise RuntimeError(f'동일 작업 식별값 중복: {key}. 잘못된 변경 알림 방지를 위해 중단')
-        rows[key] = {k: data.get(k, '') for k in FIELDS}
+            fingerprint = hashlib.sha256(json.dumps(record, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+            candidate = f'{key}|duplicate:{fingerprint}'
+            n = 2
+            while candidate in rows:
+                candidate = f'{key}|duplicate:{fingerprint}:{n}'
+                n += 1
+            key = candidate
+        rows[key] = record
     if not rows:
         raise RuntimeError(f'{requested_day}: 배정표가 비어 있어 기존 상태를 보존합니다.')
     return rows
@@ -62,6 +72,11 @@ def normalized_name(row):
 def match_rows(old_rows, current):
     pairs = []
     old_remaining, new_remaining = dict(old_rows), dict(current)
+    # Match identical full records first even when duplicate-key suffixes shift.
+    for old_key, old_row in list(old_remaining.items()):
+        new_key = next((k for k, r in new_remaining.items() if r == old_row), None)
+        if new_key is not None:
+            pairs.append((old_remaining.pop(old_key), new_remaining.pop(new_key)))
     for key in set(old_remaining) & set(new_remaining):
         pairs.append((old_remaining.pop(key), new_remaining.pop(key)))
     names = set(map(normalized_name, old_remaining.values())) & set(map(normalized_name, new_remaining.values()))
