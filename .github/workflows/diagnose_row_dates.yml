@@ -1,0 +1,40 @@
+name: Diagnose Row Dates
+on:
+  workflow_dispatch:
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+      - name: Inspect actual assignment dates
+        run: |
+          python - <<'PY'
+          from collections import Counter
+          from datetime import datetime,timedelta
+          from zoneinfo import ZoneInfo
+          import requests
+          from bs4 import BeautifulSoup
+          url='http://ystug.co.kr/sub07/sub03_01.php'
+          now=datetime.now(ZoneInfo('Asia/Seoul'))
+          days=[(now+timedelta(days=i)).strftime('%Y%m%d') for i in range(2)]
+          results=[]
+          for day in days:
+              r=requests.post(url,data={'p_dt_req':day,'p_txt_ship':'','p_nm_bizarea':'','p_nm_tugboat':''},headers={'User-Agent':'Mozilla/5.0','Referer':url},timeout=30)
+              r.raise_for_status()
+              r.encoding=r.apparent_encoding if r.apparent_encoding.lower()!='ascii' else 'utf-8'
+              soup=BeautifulSoup(r.text,'html.parser')
+              table=soup.select_one('table.wover_table')
+              if table is None:raise RuntimeError('배정표를 찾지 못했습니다')
+              headers=[h.get_text(' ',strip=True) for h in table.select('thead th')]
+              if '요청일시' not in headers:raise RuntimeError(f'요청일시 열 없음: {headers}')
+              ix=headers.index('요청일시')
+              rows=[]
+              for tr in table.select('tbody tr'):
+                  cells=[c.get_text(' ',strip=True) for c in tr.find_all('td',recursive=False)]
+                  if len(cells)==len(headers):rows.append(cells)
+              counts=Counter(row[ix][:10] for row in rows)
+              print(f'요청일 {day}: 전체 {len(rows)}행 / 요청일시별 날짜 분포: {dict(counts)}')
+              results.append([tuple(row) for row in rows])
+          print('두 조회의 실제 표 행 동일 여부:',results[0]==results[1])
+          PY
