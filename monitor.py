@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,13 +12,15 @@ URL = 'http://ystug.co.kr/sub07/sub03_01.php'
 STATE = Path('state.json')
 KST = ZoneInfo('Asia/Seoul')
 FIELDS = ['선박명', '총톤수', '흘수', '요청일시', '시작점', '종료점', 'Work', 'B', 'B/T', '배정예선']
+# Only notify changes to operational details, not formatting or tonnage.
+CHANGE_FIELDS = ['요청일시', '시작점', '종료점', 'Work', 'B', 'B/T', '배정예선']
 
 
 def parse_rows(html):
     soup = BeautifulSoup(html, 'html.parser')
     table = soup.select_one('table.wover_table')
     if table is None:
-        raise RuntimeError('예선 배정표를 찾지 못했습니다. 사이트 구조를 확인하세요.')
+        raise RuntimeError('예선 배정표를 찾지 못했습니다.')
     headings = [x.get_text(' ', strip=True) for x in table.select('thead th')]
     if not all(x in headings for x in FIELDS):
         raise RuntimeError(f'표 항목이 변경되었습니다: {headings}')
@@ -30,31 +33,61 @@ def parse_rows(html):
         key = '|'.join(data.get(x, '') for x in ['선박명', '요청일시', '시작점', '종료점'])
         rows[key] = {k: data.get(k, '') for k in FIELDS}
     if not rows:
-        raise RuntimeError('배정표가 비어 있습니다. 빈 응답을 삭제로 처리하지 않습니다.')
+        raise RuntimeError('조회 결과가 비어 있어 기존 상태를 보존합니다.')
     return rows
 
 
 def assigned(row):
-    # Exact tug name, not a substring such as '서650'.
-    import re
-    return bool(re.search(r'(?<![가-힣A-Za-z0-9])서\s*65(?![가-힣A-Za-z0-9])', row['배정예선']))
+    return bool(row and re.search(r'(?<![가-힣A-Za-z0-9])서\s*65(?![가-힣A-Za-z0-9])', row.get('배정예선', '')))
 
 
 def eligible(row, now):
     try:
         req = datetime.strptime(row['요청일시'], '%Y/%m/%d %H:%M').replace(tzinfo=KST)
-    except ValueError:
+    except (ValueError, KeyError):
         return False
-    # Tomorrow's assignments are eligible immediately; today's expire after 3h.
     return now.date() <= req.date() <= (now + timedelta(days=1)).date() and now < req + timedelta(hours=3)
 
 
-def send(token, chat_id, kind, row):
-    msg = (f"[서65 {kind}] {row['선박명']} | {row['총톤수']}톤 | 흘수 {row['흘수']} | "
-           f"{row['요청일시']} | {row['시작점']} → {row['종료점']} | "
-           f"Work {row['Work']} | B {row['B']} | B/T {row['B/T']} | 배정예선 {row['배정예선']}")
-    response = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
-                             json={'chat_id': chat_id, 'text': msg}, timeout=20)
+def normalized_name(row):
+    return ' '.join(row.get('선박명', '').upper().split())
+
+
+def match_rows(old_rows, current):
+    """Exact identity first, then unique same-ship matches for changed times/ports.
+
+    If a ship has multiple unmatched jobs, don't guess their identities.
+    """
+    pairs = []
+    old_remaining = dict(old_rows)
+    new_remaining = dict(current)
+    for key in set(old_remaining) & set(new_remaining):
+        pairs.append((old_remaining.pop(key), new_remaining.pop(key)))
+    names = set(map(normalized_name, old_remaining.values())) & set(map(normalized_name, new_remaining.values()))
+    for name in names:
+        old_keys = [k for k, r in old_remaining.items() if normalized_name(r) == name]
+        new_keys = [k for k, r in new_remaining.items() if normalized_name(r) == name]
+        if len(old_keys) == 1 and len(new_keys) == 1:
+            pairs.append((old_remaining.pop(old_keys[0]), new_remaining.pop(new_keys[0])))
+    pairs.extend((r, None) for r in old_remaining.values())
+    pairs.extend((None, r) for r in new_remaining.values())
+    return pairs
+
+
+def describe(row):
+    return (f"{row['선박명']} | {row['총톤수']}톤 | 흘수 {row['흘수']}\n"
+            f"요청일시 {row['요청일시']} | {row['시작점']} → {row['종료점']}\n"
+            f"Work {row['Work']} | B {row['B']} | B/T {row['B/T']}\n"
+            f"배정예선 {row['배정예선']}")
+
+
+def send(token, chat_id, kind, row, changes=None):
+    lines = [f'[{kind}] 서65', describe(row)]
+    if changes:
+        lines.append('변경: ' + ' / '.join(f'{k}: {before or "-"} → {after or "-"}' for k, before, after in changes))
+    response = requests.post(
+        f'https://api.telegram.org/bot{token}/sendMessage',
+        json={'chat_id': chat_id, 'text': '\n'.join(lines)}, timeout=20)
     response.raise_for_status()
     if not response.json().get('ok'):
         raise RuntimeError('텔레그램 전송 실패')
@@ -62,8 +95,7 @@ def send(token, chat_id, kind, row):
 
 def fetch_rows(day):
     response = requests.post(
-        URL,
-        data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
+        URL, data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
         headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
     response.raise_for_status()
     response.encoding = response.apparent_encoding if response.apparent_encoding.lower() != 'ascii' else 'utf-8'
@@ -76,15 +108,12 @@ def main():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
-        raise RuntimeError('GitHub Secrets에 TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID가 필요합니다.')
-
-    # Fetch both days before sending or writing any state.
+        raise RuntimeError('GitHub Secrets를 확인하세요.')
     current_by_day = {day: fetch_rows(day) for day in days}
     previous = json.loads(STATE.read_text(encoding='utf-8')) if STATE.exists() else {}
     if 'days' in previous:
         previous_by_day = previous['days']
     elif previous.get('day') and isinstance(previous.get('rows'), dict):
-        # Migrate the existing one-day state without losing today's baseline.
         previous_by_day = {previous['day']: previous['rows']}
     else:
         previous_by_day = {}
@@ -95,19 +124,23 @@ def main():
         if old_rows is None:
             print(f'{day}: 첫 조회 기준 데이터 저장 (알림 없음)')
             continue
-        for key in set(old_rows) | set(current):
-            old = old_rows.get(key)
-            new = current.get(key)
-            was = assigned(old) if old else False
-            is_now = assigned(new) if new else False
-            if was == is_now:
-                continue
-            row = new or old
-            if eligible(row, now):
-                send(token, chat_id, '신규 배정' if is_now else '배정 삭제', row)
-        print(f'{day}: {len(current)}건 조회 완료')
-
-    # Keep state for the two actively monitored dates only.
+        counts = {'신규배정': 0, '작업변경': 0, '작업취소': 0}
+        for old, new in match_rows(old_rows, current):
+            was, is_now = assigned(old), assigned(new)
+            kind, changes = None, None
+            if not was and is_now:
+                kind = '신규배정'
+            elif was and not is_now:
+                kind = '작업취소'
+            elif was and is_now:
+                changes = [(field, old.get(field, ''), new.get(field, ''))
+                           for field in CHANGE_FIELDS if old.get(field, '') != new.get(field, '')]
+                if changes:
+                    kind = '작업변경'
+            if kind and eligible(new or old, now):
+                send(token, chat_id, kind, new or old, changes)
+                counts[kind] += 1
+        print(f'{day}: {len(current)}건 조회 완료 / 알림 {counts}')
     STATE.write_text(json.dumps({'days': current_by_day}, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
