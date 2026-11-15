@@ -45,7 +45,8 @@ def eligible(row, now):
         req = datetime.strptime(row['요청일시'], '%Y/%m/%d %H:%M').replace(tzinfo=KST)
     except ValueError:
         return False
-    return req.date() == now.date() and now < req + timedelta(hours=3)
+    # Tomorrow's assignments are eligible immediately; today's expire after 3h.
+    return now.date() <= req.date() <= (now + timedelta(days=1)).date() and now < req + timedelta(hours=3)
 
 
 def send(token, chat_id, kind, row):
@@ -59,28 +60,43 @@ def send(token, chat_id, kind, row):
         raise RuntimeError('텔레그램 전송 실패')
 
 
+def fetch_rows(day):
+    response = requests.post(
+        URL,
+        data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
+        headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding if response.apparent_encoding.lower() != 'ascii' else 'utf-8'
+    return parse_rows(response.text)
+
+
 def main():
     now = datetime.now(KST)
-    day = now.strftime('%Y%m%d')
+    days = [now.strftime('%Y%m%d'), (now + timedelta(days=1)).strftime('%Y%m%d')]
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
         raise RuntimeError('GitHub Secrets에 TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID가 필요합니다.')
-    response = requests.post(URL, data={'p_dt_req': day, 'p_txt_ship': '',
-                                        'p_nm_bizarea': '', 'p_nm_tugboat': ''},
-                             headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding if response.apparent_encoding.lower() not in ('ascii',) else 'utf-8'
-    current = parse_rows(response.text)
+
+    # Fetch both days before sending or writing any state.
+    current_by_day = {day: fetch_rows(day) for day in days}
     previous = json.loads(STATE.read_text(encoding='utf-8')) if STATE.exists() else {}
-    if previous.get('day') != day:
-        # Midnight rollover is NOT a deletion. First observation is baseline.
-        previous_rows = None
+    if 'days' in previous:
+        previous_by_day = previous['days']
+    elif previous.get('day') and isinstance(previous.get('rows'), dict):
+        # Migrate the existing one-day state without losing today's baseline.
+        previous_by_day = {previous['day']: previous['rows']}
     else:
-        previous_rows = previous.get('rows', {})
-    if previous_rows is not None:
-        for key in set(previous_rows) | set(current):
-            old = previous_rows.get(key)
+        previous_by_day = {}
+
+    for day in days:
+        current = current_by_day[day]
+        old_rows = previous_by_day.get(day)
+        if old_rows is None:
+            print(f'{day}: 첫 조회 기준 데이터 저장 (알림 없음)')
+            continue
+        for key in set(old_rows) | set(current):
+            old = old_rows.get(key)
             new = current.get(key)
             was = assigned(old) if old else False
             is_now = assigned(new) if new else False
@@ -89,8 +105,10 @@ def main():
             row = new or old
             if eligible(row, now):
                 send(token, chat_id, '신규 배정' if is_now else '배정 삭제', row)
-    STATE.write_text(json.dumps({'day': day, 'rows': current}, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f'{day}: {len(current)}건 조회 완료')
+        print(f'{day}: {len(current)}건 조회 완료')
+
+    # Keep state for the two actively monitored dates only.
+    STATE.write_text(json.dumps({'days': current_by_day}, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 if __name__ == '__main__':
