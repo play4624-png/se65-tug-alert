@@ -16,13 +16,8 @@ FIELDS = ['선박명', '총톤수', '흘수', '요청일시', '시작점', '종�
 CHANGE_FIELDS = ['요청일시', '시작점', '종료점', 'Work', 'B', 'B/T', '배정예선']
 
 
-def parse_rows(html, requested_day):
+def parse_rows(html):
     soup = BeautifulSoup(html, 'html.parser')
-    date_input = soup.select_one('input[name="p_dt_req"]')
-    returned_day = (date_input.get('value') or '').strip() if date_input else ''
-    if returned_day != requested_day:
-        raise RuntimeError(f'날짜 불일치: 요청 {requested_day}, 응답 {returned_day or "없음"}. 상태 저장 및 알림 중단')
-
     table = soup.select_one('table.wover_table')
     if table is None:
         raise RuntimeError('예선 배정표를 찾지 못했습니다.')
@@ -30,28 +25,34 @@ def parse_rows(html, requested_day):
     if not all(x in headings for x in FIELDS):
         raise RuntimeError(f'표 항목이 변경되었습니다: {headings}')
     rows = {}
+    valid_dates = 0
     for tr in table.select('tbody tr'):
         cells = [x.get_text(' ', strip=True) for x in tr.find_all('td', recursive=False)]
         if len(cells) != len(headings):
             continue
         data = dict(zip(headings, cells))
-        key = '|'.join(data.get(x, '') for x in ['선박명', '요청일시', '시작점', '종료점'])
-        # Keep every row, including jobs sharing the same ship/time/ports.
-        # A content fingerprint makes duplicate keys stable across row reordering.
         record = {k: data.get(k, '') for k in FIELDS}
-        if key in rows:
-            fingerprint = hashlib.sha256(json.dumps(record, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
-            candidate = f'{key}|duplicate:{fingerprint}'
-            n = 2
-            while candidate in rows:
-                candidate = f'{key}|duplicate:{fingerprint}:{n}'
-                n += 1
-            key = candidate
+        try:
+            datetime.strptime(record['요청일시'], '%Y/%m/%d %H:%M')
+            valid_dates += 1
+        except ValueError:
+            continue
+        # Include full content in key; identical rows get distinct occurrence suffixes.
+        fingerprint = hashlib.sha256(json.dumps(record, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        key = fingerprint
+        occurrence = 2
+        while key in rows:
+            key = f'{fingerprint}:{occurrence}'
+            occurrence += 1
         rows[key] = record
-    if not rows:
-        raise RuntimeError(f'{requested_day}: 배정표가 비어 있어 기존 상태를 보존합니다.')
+    if not rows or valid_dates == 0:
+        raise RuntimeError('유효한 배정표 행이 없어 기존 상태를 보존합니다.')
     return rows
 
+
+def filter_dates(rows, dates):
+    return {key: row for key, row in rows.items()
+            if row['요청일시'][:10].replace('/', '') in dates}
 
 def assigned(row):
     return bool(row and re.search(r'(?<![가-힣A-Za-z0-9])서\s*65(?![가-힣A-Za-z0-9])', row.get('배정예선', '')))
@@ -109,12 +110,13 @@ def send(token, chat_id, kind, row, changes=None):
 
 
 def fetch_rows(day, session):
-    response = session.post(URL,
-                            data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
-                            headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
+    response = session.post(
+        URL,
+        data={'p_dt_req': day, 'p_txt_ship': '', 'p_nm_bizarea': '', 'p_nm_tugboat': ''},
+        headers={'User-Agent': 'Mozilla/5.0', 'Referer': URL}, timeout=30)
     response.raise_for_status()
     response.encoding = response.apparent_encoding if response.apparent_encoding.lower() != 'ascii' else 'utf-8'
-    return parse_rows(response.text, day)
+    return parse_rows(response.text)
 
 
 def main():
@@ -123,25 +125,21 @@ def main():
     token, chat_id = os.environ.get('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
         raise RuntimeError('GitHub Secrets를 확인하세요.')
+
     with requests.Session() as session:
-        current_by_day = {day: fetch_rows(day, session) for day in days}
-    if current_by_day[days[0]] == current_by_day[days[1]]:
-        raise RuntimeError('오늘과 내일 배정표가 완전히 동일합니다. 날짜 필터 미적용 가능성으로 알림과 상태 저장을 중단합니다.')
-
-    previous = json.loads(STATE.read_text(encoding='utf-8')) if STATE.exists() else {}
-    if 'days' in previous:
-        previous_by_day = previous['days']
-    elif previous.get('day') and isinstance(previous.get('rows'), dict):
-        previous_by_day = {previous['day']: previous['rows']}
-    else:
-        previous_by_day = {}
-
+        all_rows = fetch_rows(days[0], session)
+    current = filter_dates(all_rows, set(days))
     for day in days:
-        current = current_by_day[day]
-        old_rows = previous_by_day.get(day)
-        if old_rows is None:
-            print(f'{day}: {len(current)}건 조회 완료 / 첫 조회 기준 데이터 저장 (알림 없음)')
-            continue
+        count = sum(row['요청일시'][:10].replace('/', '') == day for row in current.values())
+        print(f'{day}: 요청일시 기준 {count}건 / 전체 응답 {len(all_rows)}건')
+
+    # Version 2 uses a global two-day snapshot rather than the old per-day state.
+    # On migration, establish a new baseline; never treat old data as deletions.
+    previous = json.loads(STATE.read_text(encoding='utf-8')) if STATE.exists() else {}
+    old_rows = filter_dates(previous.get('rows', {}), set(days)) if previous.get('version') == 2 else None
+    if old_rows is None:
+        print('새 날짜 필터 방식 첫 실행: 기준 데이터 저장 (알림 없음)')
+    else:
         counts = {'신규배정': 0, '작업변경': 0, '작업취소': 0}
         for old, new in match_rows(old_rows, current):
             was, is_now = assigned(old), assigned(new)
@@ -158,8 +156,9 @@ def main():
             if kind and eligible(new or old, now):
                 send(token, chat_id, kind, new or old, changes)
                 counts[kind] += 1
-        print(f'{day}: {len(current)}건 조회 완료 / 알림 {counts}')
-    STATE.write_text(json.dumps({'days': current_by_day}, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(f'알림 {counts}')
+    STATE.write_text(json.dumps({'version': 2, 'days': days, 'rows': current},
+                                ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 if __name__ == '__main__':
