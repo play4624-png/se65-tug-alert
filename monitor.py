@@ -40,13 +40,10 @@ def parse_rows(html, day):
         row = {k: row.get(k, '') for k in FIELDS}
         key = '|'.join(row[k] for k in ['선박명', '요청일시', '시작점', '종료점'])
         grouped[key].append(row)
-    # Keep duplicate assignments instead of silently overwriting them.
     rows = {}
     for key, entries in grouped.items():
         for i, row in enumerate(sorted(entries, key=lambda r: json.dumps(r, ensure_ascii=False, sort_keys=True))):
             rows[f'{key}|#{i+1}'] = row
-    # Empty target-day results can be legitimate, but cannot safely establish deletion
-    # without an independent confirmation that the site returned an actual empty day.
     if not rows:
         raise RuntimeError(f'{day}: 해당 날짜의 행이 없습니다. 오탐 방지를 위해 중단합니다.')
     return rows
@@ -84,16 +81,12 @@ def ship(row):
 
 
 def match_rows(old_rows, new_rows):
-    """Match identical jobs, then only unambiguous same-ship jobs.
-
-    Unmatched jobs for ships with multiple possible counterparts are ignored
-    rather than generating potentially false cancellation/new-assignment alerts.
-    """
     old_remaining, new_remaining = dict(old_rows), dict(new_rows)
     pairs = []
-    # Exact composite identity first; legacy state keys can have different suffixes.
+
     def identity(row):
         return tuple(row.get(k, '') for k in ('선박명', '요청일시', '시작점', '종료점'))
+
     old_groups, new_groups = defaultdict(list), defaultdict(list)
     for k, row in old_remaining.items():
         old_groups[identity(row)].append(k)
@@ -101,7 +94,6 @@ def match_rows(old_rows, new_rows):
         new_groups[identity(row)].append(k)
     for ident in old_groups.keys() & new_groups.keys():
         oks, nks = old_groups[ident], new_groups[ident]
-        # When duplicate identical identities exist, pair only if unique.
         if len(oks) == len(nks) == 1:
             ok, nk = oks[0], nks[0]
             pairs.append((old_remaining.pop(ok), new_remaining.pop(nk)))
@@ -159,12 +151,47 @@ def send(token, chat_id, kind, row, old=None, new=None):
                 lines.append(f"{label}: {old.get(field) or '-'} → {new.get(field) or '-'}")
         changes = tug_changes(old, new)
         if changes:
-            lines.append(changes)  # Always at the end
+            lines.append(changes)
     response = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
                              json={'chat_id': chat_id, 'text': '\n'.join(lines)}, timeout=20)
     response.raise_for_status()
     if not response.json().get('ok'):
         raise RuntimeError('텔레그램 전송 실패')
+
+
+def normalize_day_rows(data):
+    """Accept keyed rows or a list of row dictionaries from older state formats."""
+    if isinstance(data, dict):
+        return data if all(isinstance(v, dict) for v in data.values()) else None
+    if isinstance(data, list) and all(isinstance(row, dict) for row in data):
+        return {f'legacy-#{i}': row for i, row in enumerate(data, 1)}
+    return None
+
+
+def load_previous():
+    if not STATE.exists():
+        return {}
+    previous = json.loads(STATE.read_text(encoding='utf-8'))
+    if not isinstance(previous, dict):
+        raise RuntimeError('state.json 최상위 형식이 올바르지 않습니다. 파일을 확인해 주세요.')
+    raw_days = previous.get('days')
+    if isinstance(raw_days, dict):
+        result = {}
+        for day, data in raw_days.items():
+            rows = normalize_day_rows(data)
+            if rows is not None:
+                result[day] = rows
+            else:
+                print(f'주의: {day}의 기존 데이터 형식이 불명확하여 최초 기준 저장으로 처리합니다.')
+        return result
+    if isinstance(raw_days, list):
+        print('주의: state.json의 days가 리스트입니다. 기존 기록을 추측해 비교하지 않고 기준을 다시 저장합니다.')
+        return {}
+    if isinstance(previous.get('day'), str):
+        rows = normalize_day_rows(previous.get('rows'))
+        if rows is not None:
+            return {previous['day']: rows}
+    return {}
 
 
 def main():
@@ -174,13 +201,7 @@ def main():
     if not token or not chat_id:
         raise RuntimeError('GitHub Secrets에 TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID가 필요합니다.')
     current_by_day = {day: fetch_rows(day) for day in days}
-    previous = json.loads(STATE.read_text(encoding='utf-8')) if STATE.exists() else {}
-    if 'days' in previous:
-        previous_by_day = previous['days']
-    elif previous.get('day') and isinstance(previous.get('rows'), dict):
-        previous_by_day = {previous['day']: previous['rows']}
-    else:
-        previous_by_day = {}
+    previous_by_day = load_previous()
     for day in days:
         current = current_by_day[day]
         old_rows = previous_by_day.get(day)
