@@ -1,0 +1,48 @@
+name: Diagnose Tug Dates
+on:
+  workflow_dispatch:
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+      - name: Compare date requests
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests
+          from bs4 import BeautifulSoup
+          from datetime import datetime,timedelta
+          from zoneinfo import ZoneInfo
+          URL='http://ystug.co.kr/sub07/sub03_01.php'
+          now=datetime.now(ZoneInfo('Asia/Seoul'))
+          days=[(now+timedelta(days=i)).strftime('%Y%m%d') for i in range(2)]
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':URL})
+          def check(label,response):
+              response.raise_for_status()
+              response.encoding=response.apparent_encoding if response.apparent_encoding.lower()!='ascii' else 'utf-8'
+              soup=BeautifulSoup(response.text,'html.parser')
+              inp=soup.select_one('input[name="p_dt_req"]')
+              returned=inp.get('value','') if inp else 'MISSING'
+              table=soup.select_one('table.wover_table')
+              rows=[]
+              if table:
+                  for tr in table.select('tbody tr'):
+                      cells=[c.get_text(' ',strip=True) for c in tr.find_all('td',recursive=False)]
+                      if len(cells)>4:rows.append(cells)
+              print(f'{label}: status={response.status_code}, returned_date={returned}, rows={len(rows)}, first_ship={rows[0][1] if rows else "NONE"}, first_request={rows[0][4] if rows and len(rows[0])>4 else "NONE"}')
+              return [tuple(r) for r in rows]
+          for method in ['POST','GET']:
+              results=[]
+              for day in days:
+                  data={'p_dt_req':day,'p_txt_ship':'','p_nm_bizarea':'','p_nm_tugboat':''}
+                  try:
+                      r=s.post(URL,data=data,timeout=30) if method=='POST' else s.get(URL,params=data,timeout=30)
+                      results.append(check(f'{method} {day}',r))
+                  except Exception as e:
+                      print(f'{method} {day}: ERROR {type(e).__name__}: {e}')
+              if len(results)==2:
+                  print(f'{method}: both_days_identical={results[0]==results[1]}')
+          PY
