@@ -683,7 +683,7 @@
         "Work": "BE",
         "B": "P",
         "B/T": "N",
-        "배정예선": ""
+        "배정예선": "호17"
       },
       "HUA NAN 1|2026/11/16 17:30|PS-3|JH-4|#1": {
         "선박명": "HUA NAN 1",
@@ -1110,5 +1110,6 @@
     }
   },
   "keyboard_ready": true,
+  "keyboard_chat_id": "-5216460280",
   "telegram_offset": 431794668
 }
