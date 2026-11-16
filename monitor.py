@@ -266,6 +266,7 @@ def command_reply(mode, current_by_day, now):
 def process_commands(token, chat_id, current_by_day, now, offset):
     updates = get_updates(token, offset)
     new_offset = offset
+    replied_modes = set()  # 같은 실행에서 조회 종류별 결과는 한 번만 게시
     for update in updates:
         update_id = update.get('update_id')
         if not isinstance(update_id, int):
@@ -281,9 +282,13 @@ def process_commands(token, chat_id, current_by_day, now, offset):
                 except RuntimeError as exc:
                     # 5분 주기 폴링에서는 callback_query가 만료될 수 있다.
                     print(f'버튼 응답 확인 지연 (조회 결과는 계속 전송): {exc}')
-                for reply in command_reply(mode, current_by_day, now):
-                    telegram_send(token, chat_id, reply)
-                print(f'인라인 버튼 처리: {mode}')
+                if mode not in replied_modes:
+                    for reply in command_reply(mode, current_by_day, now):
+                        telegram_send(token, chat_id, reply)
+                    replied_modes.add(mode)
+                    print(f'인라인 버튼 처리: {mode}')
+                else:
+                    print(f'중복 버튼 요청 생략: {mode}')
         else:
             message = update.get('message') or {}
             msg_text = (message.get('text') or '').strip()
@@ -292,9 +297,14 @@ def process_commands(token, chat_id, current_by_day, now, offset):
             )
             message_chat = message.get('chat', {}).get('id')
             if str(message_chat) == str(chat_id) and command in COMMANDS:
-                for reply in command_reply(COMMANDS[command], current_by_day, now):
-                    telegram_send(token, chat_id, reply)
-                print(f'텔레그램 명령어 처리: {command}')
+                mode = COMMANDS[command]
+                if mode not in replied_modes:
+                    for reply in command_reply(mode, current_by_day, now):
+                        telegram_send(token, chat_id, reply)
+                    replied_modes.add(mode)
+                    print(f'텔레그램 명령어 처리: {command}')
+                else:
+                    print(f'중복 명령어 생략: {command}')
         new_offset = update_id + 1
     return new_offset
 
