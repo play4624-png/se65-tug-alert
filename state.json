@@ -882,7 +882,7 @@
       "CRANE REGULUS|2026/11/17 09:00|SNP|WA-W|#1": {
         "선박명": "CRANE REGULUS",
         "총톤수": "4,376",
-        "흘수": "4.8",
+        "흘수": "5.0",
         "요청일시": "2026/11/17 09:00",
         "시작점": "SNP",
         "종료점": "WA-W",
@@ -1136,5 +1136,5 @@
   "keyboard_ready": true,
   "keyboard_chat_id": "-1003918053220",
   "keyboard_mode": "inline",
-  "telegram_offset": 431794694
+  "telegram_offset": 431794696
 }
