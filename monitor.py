@@ -267,6 +267,7 @@ def process_commands(token, chat_id, current_by_day, now, offset):
     updates = get_updates(token, offset)
     new_offset = offset
     replied_modes = set()  # 같은 실행에서 조회 종류별 결과는 한 번만 게시
+    new_members_joined = False
     for update in updates:
         update_id = update.get('update_id')
         if not isinstance(update_id, int):
@@ -296,6 +297,10 @@ def process_commands(token, chat_id, current_by_day, now, offset):
                 msg_text.split(maxsplit=1)[0].split('@', 1)[0] if msg_text else ''
             )
             message_chat = message.get('chat', {}).get('id')
+            # 텔레그램 입장 서비스 메시지: 여러 명이 함께 들어와도 안내는 1회
+            if (str(message_chat) == str(chat_id)
+                    and message.get('new_chat_members')):
+                new_members_joined = True
             if str(message_chat) == str(chat_id) and command in COMMANDS:
                 mode = COMMANDS[command]
                 if mode not in replied_modes:
@@ -306,6 +311,15 @@ def process_commands(token, chat_id, current_by_day, now, offset):
                 else:
                     print(f'중복 명령어 생략: {command}')
         new_offset = update_id + 1
+    if new_members_joined:
+        telegram_send(
+            token, chat_id,
+            '🚢 서65 배정 조회 안내\n'
+            '새로 입장하신 분은 아래 버튼으로 오늘·내일 배정을 확인하세요.\n'
+            '※ 조회 결과는 다음 자동 실행 때 도착할 수 있습니다.',
+            buttons=True
+        )
+        print('신규 참여자 입장: 인라인 조회 버튼 안내 1회 전송')
     return new_offset
 
 
