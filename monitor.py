@@ -136,18 +136,16 @@ def match_rows(old_rows, new_rows):
 
 
 def tug_changes(old, new):
-    before, after = Counter(tug_names(old)), Counter(tug_names(new))
-    removed, added = list((before - after).elements()), list((after - before).elements())
-    if not removed and not added:
+    """배정예선 전체 목록의 전후 변화를 표시한다."""
+    before = tug_names(old)
+    after = tug_names(new)
+
+    if Counter(before) == Counter(after):
         return None
-    if len(removed) == len(added) == 1:
-        return f'🔄 예선 변경: {removed[0]} → {added[0]}'
-    parts = []
-    if removed:
-        parts.append('제외 ' + ', '.join(removed))
-    if added:
-        parts.append('추가 ' + ', '.join(added))
-    return '🔄 예선 변경: ' + ' / '.join(parts)
+
+    before_text = ', '.join(before) if before else '미배정'
+    after_text = ', '.join(after) if after else '미배정'
+    return f'🔄 예선 변경: {before_text} → {after_text}'
 
 
 def describe(row):
@@ -196,8 +194,10 @@ def send(token, chat_id, kind, row, old=None, new=None):
             if old.get(field, '') != new.get(field, ''):
                 label = '🕒 시간 변경' if field == '요청일시' else f'✏️ {field} 변경'
                 lines.append(f"{label}: {old.get(field) or '-'} → {new.get(field) or '-'}")
+        # 빈칸에서 처음 배정된 경우는 예선 변경 문구를 생략한다.
+        # 그 밖의 배정예선 변경은 전후 전체 목록을 보여준다.
         changes = tug_changes(old, new)
-        if changes:
+        if changes and (kind != '신규배정' or tug_names(old)):
             lines.append(changes)
     telegram_send(token, chat_id, '\n'.join(lines))
 
